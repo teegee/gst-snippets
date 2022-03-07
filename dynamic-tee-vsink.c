@@ -28,8 +28,7 @@
 
 static GMainLoop *loop;
 static GstElement *pipeline;
-static GstElement *src, *dbin, *conv, *tee;
-static gboolean linked = FALSE;
+static GstElement *dbin, *vsbin, *tee;
 static GList *sinks;
 
 typedef struct
@@ -90,50 +89,19 @@ message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
   return TRUE;
 }
 
-static GstPadProbeReturn
-unlink_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
-{
-  Sink *sink = user_data;
-  GstPad *sinkpad;
-
-  if (!g_atomic_int_compare_and_exchange (&sink->removing, FALSE, TRUE))
-    return GST_PAD_PROBE_OK;
-
-  sinkpad = gst_element_get_static_pad (sink->queue, "sink");
-  gst_pad_unlink (sink->teepad, sinkpad);
-  gst_object_unref (sinkpad);
-
-  gst_bin_remove (GST_BIN (pipeline), sink->queue);
-  gst_bin_remove (GST_BIN (pipeline), sink->conv);
-  gst_bin_remove (GST_BIN (pipeline), sink->sink);
-
-  gst_element_set_state (sink->sink, GST_STATE_NULL);
-  gst_element_set_state (sink->conv, GST_STATE_NULL);
-  gst_element_set_state (sink->queue, GST_STATE_NULL);
-
-  gst_object_unref (sink->queue);
-  gst_object_unref (sink->conv);
-  gst_object_unref (sink->sink);
-
-  gst_element_release_request_pad (tee, sink->teepad);
-  gst_object_unref (sink->teepad);
-
-  g_print ("removed\n");
-
-  return GST_PAD_PROBE_REMOVE;
-}
-
 static gboolean
 tick_cb (gpointer data)
 {
-  if (!sinks || g_random_int () % 2 == 0) {
     Sink *sink = g_new0 (Sink, 1);
     GstPad *sinkpad;
     GstPadTemplate *templ;
 
+    GST_DEBUG_BIN_TO_DOT_FILE
+        (GST_BIN (pipeline), GST_DEBUG_GRAPH_SHOW_ALL, "before");
+
     templ =
         gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS (tee),
-        "src_%u");
+                                            "src_%u");
 
     g_print ("add\n");
 
@@ -145,7 +113,8 @@ tick_cb (gpointer data)
     sink->removing = FALSE;
 
     gst_bin_add_many (GST_BIN (pipeline), gst_object_ref (sink->queue),
-        gst_object_ref (sink->conv), gst_object_ref (sink->sink), NULL);
+                      gst_object_ref (sink->conv), gst_object_ref (sink->sink),
+                      NULL);
     gst_element_link_many (sink->queue, sink->conv, sink->sink, NULL);
 
     gst_element_sync_state_with_parent (sink->queue);
@@ -158,75 +127,14 @@ tick_cb (gpointer data)
 
     g_print ("added\n");
 
+    GST_DEBUG_BIN_TO_DOT_FILE
+        (GST_BIN (pipeline), GST_DEBUG_GRAPH_SHOW_ALL, "added");
+
     sinks = g_list_append (sinks, sink);
-  } else {
-    Sink *sink;
 
-    g_print ("remove\n");
-
-    sink = sinks->data;
-    sinks = g_list_delete_link (sinks, sinks);
-    gst_pad_add_probe (sink->teepad, GST_PAD_PROBE_TYPE_IDLE, unlink_cb, sink,
-        (GDestroyNotify) g_free);
-  }
-
-  return TRUE;
+    return FALSE;
 }
 
-static void
-pad_added_cb (GstElement * element, GstPad * pad, gpointer user_data)
-{
-  GstCaps *caps;
-  GstStructure *s;
-  const gchar *name;
-
-  if (linked)
-    return;
-
-  caps = gst_pad_get_current_caps (pad);
-  s = gst_caps_get_structure (caps, 0);
-  name = gst_structure_get_name (s);
-
-  if (strcmp (name, "video/x-raw") == 0) {
-    GstPad *sinkpad, *teepad;
-    GstElement *queue, *sink;
-    GstPadTemplate *templ;
-
-    sinkpad = gst_element_get_static_pad (conv, "sink");
-    if (gst_pad_link (pad, sinkpad) != GST_PAD_LINK_OK) {
-      g_printerr ("Failed to link dbin with conv\n");
-      gst_object_unref (sinkpad);
-      g_main_loop_quit (loop);
-      return;
-    }
-    gst_object_unref (sinkpad);
-
-    templ =
-        gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS (tee),
-        "src_%u");
-    teepad = gst_element_request_pad (tee, templ, NULL, NULL);
-    queue = gst_element_factory_make ("queue", NULL);
-    sink = gst_element_factory_make ("fakesink", NULL);
-
-    g_object_set (sink, "sync", TRUE, NULL);
-
-    gst_bin_add_many (GST_BIN (pipeline), queue, sink, NULL);
-
-    gst_element_sync_state_with_parent (sink);
-    gst_element_sync_state_with_parent (queue);
-
-    gst_element_link_many (queue, sink, NULL);
-
-    sinkpad = gst_element_get_static_pad (queue, "sink");
-    gst_pad_link (teepad, sinkpad);
-    gst_object_unref (sinkpad);
-
-    g_timeout_add_seconds (3, tick_cb, NULL);
-    linked = TRUE;
-  }
-
-  gst_caps_unref (caps);
-}
 
 int
 main (int argc, char **argv)
@@ -241,26 +149,55 @@ main (int argc, char **argv)
   gst_init (&argc, &argv);
 
   pipeline = gst_pipeline_new (NULL);
-  src = gst_element_factory_make ("filesrc", NULL);
-  dbin = gst_element_factory_make ("decodebin", NULL);
-  conv = gst_element_factory_make ("videoconvert", NULL);
-  tee = gst_element_factory_make ("tee", NULL);
+  dbin = gst_element_factory_make ("playbin", NULL);
 
-  if (!pipeline || !src || !dbin || !conv || !tee) {
+  // Create a new bin to act as playbin videosink.
+  vsbin = gst_bin_new ("videosinkbin");
+  tee = gst_element_factory_make ("tee", NULL);
+  GstElement *queue = gst_element_factory_make ("queue", NULL);
+  GstElement *sink = gst_element_factory_make ("fakesink", NULL);
+
+  if (!pipeline || !dbin || !tee || !queue || !sink) {
     g_error ("Failed to create elements");
     return -1;
   }
 
-  g_object_set (src, "location", argv[1], NULL);
+  g_object_set (sink, "sync", TRUE, NULL);
+  g_object_set (dbin, "uri", argv[1], NULL);
 
-  gst_bin_add_many (GST_BIN (pipeline), src, dbin, conv, tee, NULL);
-  if (!gst_element_link_many (src, dbin, NULL) ||
-      !gst_element_link_many (conv, tee, NULL)) {
+  gst_bin_add_many (GST_BIN (pipeline), dbin, NULL);
+  gst_bin_add_many (GST_BIN (vsbin), tee, queue, sink, NULL);
+
+  if (!gst_element_link_many (queue, sink, NULL)) {
     g_error ("Failed to link elements");
     return -2;
   }
 
-  g_signal_connect (dbin, "pad-added", G_CALLBACK (pad_added_cb), NULL);
+
+  GstPadTemplate *templ =
+      gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS (tee),
+                                          "src_%u");
+  GstPad *teepad = gst_element_request_pad (tee, templ, NULL, NULL);
+
+  // gst_element_sync_state_with_parent (sink);
+  // gst_element_sync_state_with_parent (queue);
+
+  GstPad *sinkpad = gst_element_get_static_pad (queue, "sink");
+  gst_pad_link (teepad, sinkpad);
+  gst_object_unref (sinkpad);
+
+  GstPad     *pad = gst_element_get_static_pad (tee, "sink");
+  GstPad     *ghostPad = gst_ghost_pad_new ("sink", pad);
+
+  gst_pad_set_active (ghostPad, TRUE);
+  gst_element_add_pad (vsbin, ghostPad);
+  gst_object_unref (pad);
+
+  g_object_set (dbin, "video-sink", vsbin, NULL);
+
+
+
+  g_timeout_add_seconds (2, tick_cb, NULL);
 
   loop = g_main_loop_new (NULL, FALSE);
 
