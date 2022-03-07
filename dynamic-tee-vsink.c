@@ -107,12 +107,12 @@ tick_cb (gpointer data)
 
     sink->teepad = gst_element_request_pad (tee, templ, NULL, NULL);
 
-    sink->queue = gst_element_factory_make ("queue", NULL);
-    sink->conv = gst_element_factory_make ("videoconvert", NULL);
-    sink->sink = gst_element_factory_make ("autovideosink", NULL);
+    sink->queue = gst_element_factory_make ("queue", "vsbqueue");
+    sink->conv = gst_element_factory_make ("videoconvert", "vsbconv");
+    sink->sink = gst_element_factory_make ("autovideosink", "vsbsink");
     sink->removing = FALSE;
 
-    gst_bin_add_many (GST_BIN (pipeline), gst_object_ref (sink->queue),
+    gst_bin_add_many (GST_BIN (vsbin), gst_object_ref (sink->queue),
                       gst_object_ref (sink->conv), gst_object_ref (sink->sink),
                       NULL);
     gst_element_link_many (sink->queue, sink->conv, sink->sink, NULL);
